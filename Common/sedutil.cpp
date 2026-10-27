@@ -18,6 +18,9 @@ along with sedutil.  If not, see <http://www.gnu.org/licenses/>.
 
 * C:E********************************************************************** */
 #include <iostream>
+#include <csignal>
+#include <termios.h>
+#include <unistd.h>
 #include "os.h"
 #include "DtaHashPwd.h"
 #include "DtaOptions.h"
@@ -50,12 +53,74 @@ int isValidSEDDisk(char *devname)
 	return 0;
 }
 
+/* A password argument of "-" is read as one line from stdin instead, so it
+ * does not show up in ps or /proc/<pid>/cmdline. Lines are consumed in
+ * argument order (password first, then newpassword). On a terminal it prompts
+ * with echo off. A literal "-" password can still be given as -x 2d. */
+static struct termios savedTermios;
+
+/* restore echo if the password prompt is interrupted, then die from the signal */
+static void restoreTermiosAndRaise(int sig)
+{
+	tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+static char * readPasswordFromStdin(char * buf, size_t size, const char * prompt)
+{
+	static const int signals[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP };
+	struct sigaction restore = {}, previous[sizeof(signals) / sizeof(signals[0])];
+	struct termios noecho;
+	bool tty = isatty(STDIN_FILENO) && (0 == tcgetattr(STDIN_FILENO, &savedTermios));
+	if (tty) {
+		restore.sa_handler = restoreTermiosAndRaise;
+		for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++)
+			sigaction(signals[i], &restore, &previous[i]);
+		fprintf(stderr, "%s: ", prompt);
+		noecho = savedTermios;
+		noecho.c_lflag &= ~ECHO;
+		/* TCSANOW, not TCSAFLUSH: keep input typed or pasted ahead for this prompt */
+		tcsetattr(STDIN_FILENO, TCSANOW, &noecho);
+	}
+	char * line = fgets(buf, (int)size, stdin);
+	if (tty) {
+		tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios);
+		for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++)
+			sigaction(signals[i], &previous[i], NULL);
+		fprintf(stderr, "\n");
+	}
+	if (NULL == line) {
+		LOG(E) << "Unable to read password from stdin";
+		return NULL;
+	}
+	size_t len = strcspn(buf, "\r\n");
+	if (('\0' == buf[len]) && (len == size - 1)) {
+		/* no line end within the buffer: refuse instead of using a truncated
+		 * password and leaving the rest for the next read */
+		memset(buf, 0, size);
+		LOG(E) << "Password read from stdin is longer than " << size - 2 << " characters";
+		return NULL;
+	}
+	buf[len] = '\0';
+	return buf;
+}
+
 int main(int argc, char * argv[])
 {
 	DTA_OPTIONS opts;
 	DtaDev *tempDev = NULL, *d = NULL;
+	static char stdinPassword[256], stdinNewPassword[256];
 	if (DtaOptions(argc, argv, &opts)) {
 		return DTAERROR_COMMAND_ERROR;
+	}
+	if (opts.password && !strcmp(argv[opts.password], "-")) {
+		if (NULL == (argv[opts.password] = readPasswordFromStdin(stdinPassword, sizeof(stdinPassword), "Password")))
+			return DTAERROR_COMMAND_ERROR;
+	}
+	if (opts.newpassword && !strcmp(argv[opts.newpassword], "-")) {
+		if (NULL == (argv[opts.newpassword] = readPasswordFromStdin(stdinNewPassword, sizeof(stdinNewPassword), "New password")))
+			return DTAERROR_COMMAND_ERROR;
 	}
 	
 	if ((opts.action != sedutiloption::scan) && 

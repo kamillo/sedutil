@@ -32,6 +32,7 @@ void usage()
     printf("-n (optional)                       no password hashing. Passwords will be sent in clear text!\n");
     printf("-l (optional)                       log style output to stderr only\n");
     printf("-x (optional)                       password inputs are in hex form\n");
+    printf("A password given as - is read as one line from stdin (use -x 2d for a literal -)\n");
     printf("actions \n");
     printf("--scan \n");
     printf("                                Scans the devices on the system \n");

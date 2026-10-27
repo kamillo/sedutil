@@ -1,7 +1,8 @@
 #!/bin/bash
 
-### Input password as hidden charactors ### 
-read -s -p "Enter Password: "  pswd
+### Input password as hidden charactors ###
+IFS= read -r -s -p "Enter Password: " pswd
+echo
 
-./sedutil-cli -v -–enableLockingRange 0 $pswd /dev/sda
-./sedutil-cli -v –-setMBREnable on $pswd /dev/sda
+printf '%s\n' "$pswd" | ./sedutil-cli -v --enableLockingRange 0 - /dev/sda
+printf '%s\n' "$pswd" | ./sedutil-cli -v --setMBREnable on - /dev/sda

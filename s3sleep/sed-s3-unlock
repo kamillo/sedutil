@@ -1,0 +1,167 @@
+#!/bin/bash
+# Stores the OPAL drive key in the kernel (IOC_OPAL_SAVE) so the drive is unlocked
+# automatically on resume from S3 sleep. Installed as /usr/local/sbin/sed-s3-unlock.
+#
+#   save    read the drive password from stdin, verify it and save it in the kernel
+#   enroll  like save, then also seal the password hash with systemd-creds (TPM2 +
+#           host key) so `boot` can save it on every boot without asking.
+#           Exits 3 if the key got saved in kernel but sealing failed.
+#   boot    used by sed-s3-unlock.service: save the sealed hash from $CREDENTIALS_DIRECTORY
+#   forget  remove the sealed hash
+#   check   exit 1 if the key was not saved since boot (blocks suspend, see sed-s3-check.service)
+#   status  print ready/missing, then enrolled/stale/not-enrolled (stale: a sealed
+#           hash exists but could not be used this boot, e.g. PCR 7 changed)
+#
+# Passwords and hashes are only ever passed through pipes, never on a command line.
+# Exit status 4 means the drive rejected the password.
+
+set -euo pipefail
+
+CONF=/etc/sed-s3-unlock.conf
+DEVICE=/dev/nvme0n1
+LOCKING_RANGE=0
+SEDUTIL=/usr/local/sbin/sedutil-cli
+# shellcheck source=sed-s3-unlock.conf
+[[ -r $CONF ]] && . "$CONF"
+# run from the repo (prepareForSleep.sh before install.sh): use the sedutil-cli built
+# there. Decided by this script's own location, never by the environment.
+self=$(readlink -f "$0")
+if [[ $self != /usr/local/sbin/sed-s3-unlock ]]; then
+    SEDUTIL=$(dirname "$(dirname "$self")")/sedutil-cli
+fi
+
+# /run is a tmpfs cleared on reboot, just like the key the kernel keeps in memory,
+# so the marker lives exactly as long as the key.
+MARKER=/run/sed-opal-s3-ready
+# set when a sealed hash worked (boot) or was created (enroll) this boot, cleared by forget
+ENROLLED_MARKER=/run/sed-opal-s3-enrolled
+CRED_NAME=sed-opal-s3
+CRED_FILE=/etc/credstore.encrypted/$CRED_NAME
+
+# sedutil picks the NVMe/SATA backend by the /dev/nvme prefix, so resolve by-id symlinks
+DEVICE=$(readlink -f "$DEVICE")
+
+log() { echo "sed-s3-unlock: $*" >&2; }
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log "must be run as root"
+        exit 1
+    fi
+}
+
+read_secret() {
+    local secret
+    IFS= read -r secret || true
+    if [[ -z $secret ]]; then
+        log "no password on stdin"
+        exit 1
+    fi
+    printf '%s' "$secret"
+}
+
+mark_ready() {
+    touch "$MARKER"
+    # refresh waybar custom/sedsleep (signal 10)
+    pkill -RTMIN+10 waybar 2>/dev/null || true
+}
+
+mark_missing() {
+    rm -f "$MARKER"
+    pkill -RTMIN+10 waybar 2>/dev/null || true
+}
+
+# $1: secret, remaining args: extra sedutil flags (-n -x when the secret is a hex hash)
+save_to_kernel() {
+    local secret=$1 rc=0 output
+    shift
+    output=$(printf '%s\n' "$secret" | "$SEDUTIL" "$@" --prepareForS3Sleep "$LOCKING_RANGE" - "$DEVICE" 2>&1) || rc=$?
+    [[ -n $output ]] && printf '%s\n' "$output" >&2
+    if [[ $rc -eq 0 ]]; then
+        mark_ready
+        log "key saved in kernel, resume from sleep will unlock $DEVICE"
+        return
+    fi
+    mark_missing
+    # sedutil's exit status mixes OPAL status codes with the ioctl's errno (EPERM is
+    # 1 like NOT_AUTHORIZED), so tell a rejected password by the authentication
+    # step's own message (DtaDevOS::prepareForS3Sleep)
+    if [[ $output == *"Unable to authenticate with the given password"* ]]; then
+        log "the drive rejected the password"
+        exit 4
+    fi
+    log "failed to save the key in kernel (sedutil exit status $rc)"
+    exit 1
+}
+
+cmd=${1:-}
+case $cmd in
+    save)
+        require_root
+        password=$(read_secret)
+        save_to_kernel "$password"
+        ;;
+    enroll)
+        require_root
+        password=$(read_secret)
+        hash=$(printf '%s\n' "$password" | "$SEDUTIL" --printPasswordHash - "$DEVICE") || hash=
+        unset password
+        if [[ ! $hash =~ ^[0-9a-f]{64}$ ]]; then
+            log "--printPasswordHash gave unexpected output"
+            exit 1
+        fi
+        # save exactly the value that gets sealed, the way boot will use it, so the
+        # drive verifies the hash itself before anything is sealed
+        save_to_kernel "$hash" -n -x
+        mkdir -p -m 0700 "$(dirname "$CRED_FILE")" || true
+        # host key lives in /var/lib/systemd on the encrypted drive, TPM2 binds it to
+        # this machine (PCR 7: Secure Boot state). Re-enroll after firmware/dbx updates.
+        if ! printf '%s' "$hash" | systemd-creds encrypt --with-key=host+tpm2 \
+                --name="$CRED_NAME" - "$CRED_FILE"; then
+            log "key saved in kernel, but sealing the hash failed: you will be asked again after reboot"
+            exit 3
+        fi
+        chmod 0600 "$CRED_FILE"
+        touch "$ENROLLED_MARKER"
+        log "password hash sealed in $CRED_FILE, it will be used on every boot"
+        ;;
+    boot)
+        require_root
+        if [[ -z ${CREDENTIALS_DIRECTORY:-} || ! -r $CREDENTIALS_DIRECTORY/$CRED_NAME ]]; then
+            log "credential $CRED_NAME not available (run from sed-s3-unlock.service)"
+            exit 1
+        fi
+        hash=$(<"$CREDENTIALS_DIRECTORY/$CRED_NAME")
+        save_to_kernel "$hash" -n -x
+        touch "$ENROLLED_MARKER"
+        ;;
+    forget)
+        require_root
+        rm -f "$CRED_FILE" "$ENROLLED_MARKER"
+        # otherwise a failed boot attempt keeps status reporting "stale"
+        systemctl reset-failed sed-s3-unlock.service 2>/dev/null || true
+        log "removed $CRED_FILE"
+        ;;
+    check)
+        if [[ ! -e $MARKER ]]; then
+            log "OPAL key not saved in kernel, refusing to suspend: $DEVICE would stay locked on resume"
+            exit 1
+        fi
+        ;;
+    status)
+        if [[ -e $MARKER ]]; then echo ready; else echo missing; fi
+        # /etc/credstore.encrypted is root-only, so judge by what happened this boot:
+        # the unit only runs (and can only fail) when a sealed hash exists
+        if [[ -e $ENROLLED_MARKER ]]; then
+            echo enrolled
+        elif systemctl is-failed -q sed-s3-unlock.service; then
+            echo stale
+        else
+            echo not-enrolled
+        fi
+        ;;
+    *)
+        echo "usage: $0 {save|enroll|boot|forget|check|status}" >&2
+        exit 2
+        ;;
+esac

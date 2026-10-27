@@ -1,0 +1,60 @@
+#!/bin/bash
+# Asks for the drive password in a GUI dialog when the OPAL key is not saved in kernel.
+# Installed as /usr/local/bin/sed-s3-prompt. Run it at login (Hyprland exec-once) and
+# from the waybar custom/sedsleep on-click. Use --force to ask even if already saved.
+
+UNLOCK=/usr/local/sbin/sed-s3-unlock
+# the only entry point polkit lets the session run without authentication
+UNLOCK_USER=/usr/local/libexec/sed-s3-unlock-user
+TITLE="Szyfrowanie dysku"
+
+# let boot finish first, so sed-s3-unlock.service (sealed hash) has run even when
+# the session starts before multi-user.target (it may not even be queued yet)
+timeout 60 systemctl is-system-running --wait >/dev/null 2>&1
+
+mapfile -t status < <("$UNLOCK" status)
+[[ ${status[0]} == ready && $1 != --force ]] && exit 0
+
+while true; do
+    password=$(zenity --password --title="$TITLE" \
+        --text="Hasło dysku, żeby wybudzenie ze snu mogło go odblokować") || exit 1
+    [[ -n $password ]] && break
+done
+
+case ${status[1]} in
+    enrolled) question= ;;
+    stale) question="Hasło zapisane w TPM przestało działać (np. po aktualizacji firmware). Zapisać je ponownie?" ;;
+    *) question="Zapamiętać hasło w TPM, żeby nie pytać po kolejnych uruchomieniach?" ;;
+esac
+action=save
+if [[ -n $question ]] &&
+    zenity --question --title="$TITLE" --ok-label="Zapamiętaj" --cancel-label="Tylko teraz" \
+        --text="$question"; then
+    action=enroll
+fi
+
+output=$(mktemp)
+trap 'rm -f "$output"' EXIT
+printf '%s\n' "$password" | pkexec "$UNLOCK_USER" "$action" >"$output" 2>&1 &
+pid=$!
+unset password
+# PBKDF2 plus the drive session take a few seconds, a wrong password 10 more
+while kill -0 "$pid" 2>/dev/null; do echo; sleep 0.3; done |
+    zenity --progress --pulsate --auto-close --no-cancel --title="$TITLE" \
+        --text="Sprawdzam hasło na dysku…" 2>/dev/null
+wait "$pid"
+case $? in
+    0)
+        notify-send -a sedutil "$TITLE" "Hasło zapisane w kernelu, sen jest bezpieczny." ;;
+    3)
+        notify-send -a sedutil -u critical "$TITLE" \
+            "Hasło zapisane w kernelu, sen jest bezpieczny. Zapis w TPM się nie udał, po restarcie zapytam ponownie." ;;
+    4)
+        zenity --error --title="$TITLE" --text="Dysk odrzucił hasło."
+        exit 1 ;;
+    *)
+        zenity --error --no-markup --title="$TITLE" --text="Nie udało się zapisać hasła:
+
+$(tail -n 3 "$output")"
+        exit 1 ;;
+esac

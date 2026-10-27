@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="org.sedutil.s3unlock">
+    <description>Save the drive encryption key for resume from sleep</description>
+    <message>Saving the OPAL drive key in the kernel requires authentication</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <!-- no extra prompt for the local session: the wrapper only allows save/enroll,
+           which act after the drive itself accepted the password, and rate-limits
+           wrong ones. Use auth_self_keep here to also require the login password. -->
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/sed-s3-unlock-user</annotate>
+  </action>
+</policyconfig>

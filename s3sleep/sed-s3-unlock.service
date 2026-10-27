@@ -1,0 +1,15 @@
+[Unit]
+Description=Save OPAL drive key in kernel for S3 resume (sealed hash)
+Documentation=file:///usr/local/sbin/sed-s3-unlock
+ConditionPathExists=/etc/credstore.encrypted/sed-opal-s3
+Wants=tpm2.target
+After=tpm2.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+LoadCredentialEncrypted=sed-opal-s3
+ExecStart=/usr/local/sbin/sed-s3-unlock boot
+
+[Install]
+WantedBy=multi-user.target

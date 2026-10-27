@@ -1,0 +1,10 @@
+# Pulled in by the systemd-suspend*.service drop-ins. If it fails, the suspend job
+# fails too and the machine stays awake instead of resuming onto a locked drive.
+[Unit]
+Description=Refuse S3 sleep while the OPAL drive key is not saved in kernel
+DefaultDependencies=no
+Before=sleep.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sed-s3-unlock check

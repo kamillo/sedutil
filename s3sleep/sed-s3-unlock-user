@@ -1,0 +1,25 @@
+#!/bin/bash
+# pkexec entry point for the desktop session (org.sedutil.s3unlock allows it without
+# authentication). Installed as /usr/local/libexec/sed-s3-unlock-user.
+# Only save and enroll are reachable from here, and each password the drive rejects
+# costs a delay, serialized across callers, so the session cannot guess it fast.
+
+FAIL_DELAY=10
+
+case ${1:-} in
+    save|enroll) ;;
+    *)
+        echo "usage: $0 {save|enroll}" >&2
+        exit 2 ;;
+esac
+
+exec 9>/run/sed-s3-unlock.lock
+flock 9
+
+/usr/local/sbin/sed-s3-unlock "$1"
+rc=$?
+# 4: the drive rejected the password, other failures are not guesses
+if [[ $rc -eq 4 ]]; then
+    sleep "$FAIL_DELAY"
+fi
+exit "$rc"
